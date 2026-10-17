@@ -522,7 +522,10 @@ async fn feed(auth: Auth<'_>, query: Option<&str>) -> Result<Resp> {
     let c = app().db.read();
     let rows = c
         .client
-        .query(&c.st.list_feed, &[&viewer, &limit, &offset])
+        .query(
+            &c.st.list_feed,
+            &[&viewer, &limit, &offset, &limit.saturating_add(offset)],
+        )
         .await?;
     drop(c);
     ok(article_list(&rows))

@@ -2,7 +2,7 @@
 //! neither request nor response buffers. Parsing uses httparse; JSON remains in api.rs.
 use crate::api;
 use http::Method;
-use std::{cell::RefCell, io};
+use std::{cell::RefCell, io, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -10,6 +10,7 @@ use tokio::{
 
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 thread_local! { static BUFFERS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) }; }
 pub(crate) fn take() -> Vec<u8> {
     BUFFERS.with(|p| {
@@ -51,7 +52,11 @@ async fn through(s: &mut TcpStream, b: &mut Vec<u8>, end: usize) -> io::Result<(
 async fn line(s: &mut TcpStream, b: &mut Vec<u8>, at: usize) -> io::Result<usize> {
     loop {
         if let Some(n) = memchr::memmem::find(&b[at..], b"\r\n") {
-            return Ok(at + n);
+            return if n <= MAX_HEAD {
+                Ok(at + n)
+            } else {
+                Err(invalid())
+            };
         }
         if b.len() - at > MAX_HEAD {
             return Err(invalid());
@@ -99,7 +104,10 @@ pub async fn serve(mut stream: TcpStream) {
     }
 }
 
-async fn handle_one(s: &mut TcpStream, input: &mut Vec<u8>) -> io::Result<bool> {
+async fn read_request(
+    s: &mut TcpStream,
+    input: &mut Vec<u8>,
+) -> io::Result<(Head, Vec<u8>, usize)> {
     let mut scan = 0;
     loop {
         if memchr::memmem::find(&input[scan..], b"\r\n\r\n").is_some() {
@@ -111,22 +119,14 @@ async fn handle_one(s: &mut TcpStream, input: &mut Vec<u8>) -> io::Result<bool> 
         scan = input.len().saturating_sub(3);
         more(s, input, MAX_HEAD).await?;
     }
-    let Head {
-        method,
-        target: target_range,
-        auth,
-        length,
-        chunked,
-        expect,
-        close,
-        end: head,
-    } = parse_head(input)?;
-    if expect {
+    let parsed = parse_head(input)?;
+    let head = parsed.end;
+    if parsed.expect {
         s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
     }
     let mut decoded = Vec::new();
     let end;
-    if chunked {
+    if parsed.chunked {
         let mut at = head;
         loop {
             let stop = line(s, input, at).await?;
@@ -169,11 +169,35 @@ async fn handle_one(s: &mut TcpStream, input: &mut Vec<u8>) -> io::Result<bool> 
             }
             decoded.extend_from_slice(&input[at..next - 2]);
             at = next;
+            // Release consumed wire framing independently of decoded body size.
+            // Keep the request head (target/auth offsets) and any pipelined bytes.
+            if at - head >= MAX_HEAD {
+                input.drain(head..at);
+                at = head;
+            }
         }
     } else {
-        end = head + length.unwrap_or(0);
+        end = head + parsed.length.unwrap_or(0);
         through(s, input, end).await?;
     }
+    Ok((parsed, decoded, end))
+}
+
+async fn handle_one(s: &mut TcpStream, input: &mut Vec<u8>) -> io::Result<bool> {
+    // Idle keep-alive is unlimited; completion is bounded once a request starts.
+    // The timer ends before database/CPU work and cannot cancel a mutation.
+    let (head, decoded, end) = tokio::time::timeout(READ_TIMEOUT, read_request(s, input))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request read deadline"))??;
+    let Head {
+        method,
+        target: target_range,
+        auth,
+        chunked,
+        close,
+        end: head,
+        ..
+    } = head;
     let target = std::str::from_utf8(&input[target_range]).map_err(|_| invalid())?;
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p, Some(q)),
@@ -192,14 +216,23 @@ async fn handle_one(s: &mut TcpStream, input: &mut Vec<u8>) -> io::Result<bool> 
     let mut output = take();
     output.extend_from_slice(b"HTTP/1.1 ");
     output.extend_from_slice(itoa::Buffer::new().format(resp.status).as_bytes());
-    output.extend_from_slice(b" OK\r\nContent-Type: application/json\r\nContent-Length: ");
-    output.extend_from_slice(itoa::Buffer::new().format(resp.body.len()).as_bytes());
+    output.extend_from_slice(b" OK\r\nContent-Type: application/json\r\n");
+    if resp.status != 204 {
+        output.extend_from_slice(b"Content-Length: ");
+        output.extend_from_slice(itoa::Buffer::new().format(resp.body.len()).as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
     output.extend_from_slice(if close {
-        b"\r\nConnection: close\r\n\r\n"
+        b"Connection: close\r\n\r\n"
     } else {
-        b"\r\n\r\n"
+        b"\r\n"
     });
-    let written = write_response(s, &output, &resp.body).await;
+    let payload = if method == Method::HEAD || resp.status == 204 {
+        &[][..]
+    } else {
+        &resp.body
+    };
+    let written = write_response(s, &output, payload).await;
     release(output);
     release(resp.body);
     written?;
@@ -306,6 +339,7 @@ async fn write_response(s: &TcpStream, mut head: &[u8], mut body: &[u8]) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
     #[tokio::test]
     #[ignore]
     async fn future_sizes() {
@@ -322,6 +356,43 @@ mod tests {
             "idle connection future: {} bytes",
             std::mem::size_of_val(&serve(stream))
         );
+    }
+    #[tokio::test]
+    async fn chunk_framing_compacts_and_preserves_pipeline() {
+        let payload = vec![b'x'; 3 * 1024 * 1024];
+        let mut wire = b"POST /api/example HTTP/1.1\r\nTransfer-Encoding: chunked\r\nAuthorization: Token example\r\n\r\n".to_vec();
+        for b in &payload {
+            wire.extend_from_slice(&[b'1', b'\r', b'\n', *b, b'\r', b'\n']);
+        }
+        let pipeline = b"GET /api/tags HTTP/1.1\r\n\r\n";
+        wire.extend_from_slice(b"0\r\nX-Trailer: present\r\n\r\n");
+        wire.extend_from_slice(pipeline);
+        for segment in [4096, 7777] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            let bytes = wire.clone();
+            let sender = tokio::spawn(async move {
+                for part in bytes.chunks(segment) {
+                    client.write_all(part).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            });
+            let mut input = Vec::new();
+            let (head, body, end) = read_request(&mut server, &mut input).await.unwrap();
+            assert_eq!(body, payload);
+            assert_eq!(&input[head.target], b"/api/example");
+            assert_eq!(&input[head.auth.unwrap()], b"Token example");
+            assert!(input.len() < 128 * 1024);
+            input.drain(..end);
+            through(&mut server, &mut input, pipeline.len())
+                .await
+                .unwrap();
+            assert_eq!(input, pipeline);
+            sender.await.unwrap();
+        }
     }
     #[test]
     fn reject_ambiguous_framing() {

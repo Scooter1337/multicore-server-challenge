@@ -12,7 +12,11 @@
 
 use std::{
     ops::Deref,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 #[cfg(feature = "group-commit")]
@@ -53,24 +57,27 @@ pub struct Conn {
     pub client: Client,
     pub st: Stmts,
     load: AtomicUsize,
+    closed: Arc<AtomicBool>,
 }
 
+struct Pool(RwLock<Box<[Arc<Conn>]>>);
+
 pub struct Db {
-    reads: Box<[Conn]>,
-    writes: Box<[Conn]>,
+    reads: Arc<Pool>,
+    writes: Arc<Pool>,
 }
 
 /// A connection picked for one request; counts as load on it until dropped.
-pub struct Lease<'a>(&'a Conn);
+pub struct Lease(Arc<Conn>);
 
-impl Deref for Lease<'_> {
+impl Deref for Lease {
     type Target = Conn;
     fn deref(&self) -> &Conn {
-        self.0
+        &self.0
     }
 }
 
-impl Drop for Lease<'_> {
+impl Drop for Lease {
     fn drop(&mut self) {
         self.0.load.fetch_sub(1, Ordering::Relaxed);
     }
@@ -91,54 +98,103 @@ impl Db {
         )
         .await?;
         let writes = conns.split_off(reads);
-        Ok(Db {
-            reads: conns.into_boxed_slice(),
-            writes: writes.into_boxed_slice(),
-        })
+        let db = Db {
+            reads: Arc::new(Pool(RwLock::new(conns.into_iter().map(Arc::new).collect()))),
+            writes: Arc::new(Pool(RwLock::new(
+                writes.into_iter().map(Arc::new).collect(),
+            ))),
+        };
+        let (reads, writes, url) = (db.reads.clone(), db.writes.clone(), url.to_owned());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                for (pool, write) in [(&reads, false), (&writes, true)] {
+                    let failed: Vec<_> = pool
+                        .0
+                        .read()
+                        .expect("database pool")
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| c.closed.load(Ordering::Acquire).then_some(i))
+                        .collect();
+                    for i in failed {
+                        // Replace the client and its statements together. Existing
+                        // leases finish on their original connection; no query is
+                        // replayed, including an uncertain commit.
+                        if let Ok(Ok(conn)) =
+                            tokio::time::timeout(Duration::from_secs(5), connect_one(&url, write))
+                                .await
+                        {
+                            pool.0.write().expect("database pool")[i] = Arc::new(conn);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(db)
     }
 
     pub fn len(&self) -> (usize, usize) {
-        (self.reads.len(), self.writes.len())
+        (
+            self.reads.0.read().expect("database pool").len(),
+            self.writes.0.read().expect("database pool").len(),
+        )
     }
 
     /// A connection for a read-only statement.
-    pub fn read(&self) -> Lease<'_> {
+    pub fn read(&self) -> Lease {
         least_loaded(&self.reads)
     }
 
     /// A connection for a statement that writes (and so waits for a commit).
-    pub fn write(&self) -> Lease<'_> {
+    pub fn write(&self) -> Lease {
         least_loaded(&self.writes)
     }
 }
 
 /// The connection with the fewest queries in flight, so nothing queues behind a busy connection while another is
 /// idle. The scan starts at a rotating index so ties spread out.
-fn least_loaded(conns: &[Conn]) -> Lease<'_> {
+fn least_loaded(pool: &Pool) -> Lease {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // One short read guard covers the scan, rather than locking every candidate
+    // and then locking the winner again. Requests retain only the selected Arc.
+    let conns = pool.0.read().expect("database pool");
     let n = conns.len();
-    let start = NEXT.fetch_add(1, Ordering::Relaxed);
-    let mut best = &conns[start % n];
-    let mut best_load = best.load.load(Ordering::Relaxed);
-    for i in 1..n {
-        if best_load == 0 {
-            break;
+    let start = NEXT.fetch_add(1, Ordering::Relaxed) % n;
+    let mut best = None;
+    let mut best_load = usize::MAX;
+    for i in 0..n {
+        let index = (start + i) % n;
+        let c = &conns[index];
+        if c.closed.load(Ordering::Acquire) {
+            continue;
         }
-        let c = &conns[(start + i) % n];
-        let l = c.load.load(Ordering::Relaxed);
-        if l < best_load {
-            best = c;
-            best_load = l;
+        let load = c.load.load(Ordering::Relaxed);
+        if load < best_load {
+            best = Some(index);
+            best_load = load;
+            if load == 0 {
+                break;
+            }
         }
     }
-    best.load.fetch_add(1, Ordering::Relaxed);
-    Lease(best)
+    // During a complete outage requests fail promptly until recovery; they never
+    // silently wait for reconnection or replay potentially committed mutations.
+    let conn = conns[best.unwrap_or(start)].clone();
+    conn.load.fetch_add(1, Ordering::Relaxed);
+    Lease(conn)
 }
 
 async fn connect_one(url: &str, _write: bool) -> Result<Conn, tokio_postgres::Error> {
     let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+    let closed = Arc::new(AtomicBool::new(false));
+    let disconnected = closed.clone();
     tokio::spawn(async move {
-        if let Err(e) = connection.await {
+        let result = connection.await;
+        disconnected.store(true, Ordering::Release);
+        if let Err(e) = result {
             eprintln!("[db] connection error: {e}");
         }
     });
@@ -166,7 +222,11 @@ async fn connect_one(url: &str, _write: bool) -> Result<Conn, tokio_postgres::Er
             &[Type::INT8, Type::INT8, Type::INT8, Type::TEXT],
         )
         .await?,
-        list_feed: p(sql::LIST_FEED, &[Type::INT8, Type::INT8, Type::INT8]).await?,
+        list_feed: p(
+            sql::LIST_FEED,
+            &[Type::INT8, Type::INT8, Type::INT8, Type::INT8],
+        )
+        .await?,
         article_by_slug: p(sql::ARTICLE_BY_SLUG, &[Type::INT8, Type::TEXT]).await?,
         article_by_id: p(sql::ARTICLE_BY_ID, &[Type::INT8, Type::INT8]).await?,
         favorite: p(sql::FAVORITE, &[Type::INT8, Type::TEXT]).await?,
@@ -217,5 +277,6 @@ async fn connect_one(url: &str, _write: bool) -> Result<Conn, tokio_postgres::Er
         client,
         st,
         load: AtomicUsize::new(0),
+        closed,
     })
 }

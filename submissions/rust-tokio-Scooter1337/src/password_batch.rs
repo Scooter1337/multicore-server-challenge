@@ -24,7 +24,7 @@ impl Pool {
             std::env::var("BCRYPT_BATCH_MS")
                 .ok()
                 .map(|s| s.parse::<u64>().expect("BCRYPT_BATCH_MS"))
-                .unwrap_or(80),
+                .unwrap_or(160),
         );
         let (tx, mut rx) = mpsc::channel::<Job>(1024);
         let permits = Arc::new(Semaphore::new(slots));
