@@ -21,3 +21,7 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 ```
 
 The API and initial SQL build on [cknutson12's MIT-licensed rust-hyper submission](https://github.com/arjaythedev/multicore-server-challenge/pull/1), with attribution retained in LICENSE. The native bcrypt source and its license are documented in native/README.md.
+
+Local full-seed comparison on MEGASERVER (Xeon E5-2690 v3), with the app and PostgreSQL sharing an 8-CPU quota and 16 GiB, no affinity or host tuning. The unchanged load generator confirmed 70,000 users over five minutes: 17,650 req/s, p95 399 ms, p99 474 ms, zero errors, 256 MiB peak app RSS. The same search/hold procedure confirmed 52,000 users / 13,361 req/s for C++ PR #4 (`52a7ffc`), 44,000 for Rust PR #1 and 18,000 for V PR #2. Generators ran in separate containers on the same physical host and passed CPU/port validation; these are local comparisons, not official challenge scores.
+
+Validation: all 197 unchanged conformance checks on both dev and full seeds, HTTP framing/pipelining checks, concurrent tags/favorites, grouped-write rollback isolation and immediate visibility, release unit tests, Clippy, and native bcrypt ASan/UBSan compatibility checks.
