@@ -11,24 +11,64 @@ use tokio::{
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-thread_local! { static BUFFERS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) }; }
+// Separate tiny request heads from response buffers so active requests do not
+// retain a large response allocation while waiting for PostgreSQL. Each class
+// has a fixed 64-slot free stack and never allocates its bookkeeping.
+struct Pool {
+    slots: [[Vec<u8>; 64]; 4],
+    len: [usize; 4],
+}
+impl Pool {
+    const fn new() -> Self {
+        Self {
+            slots: [const { [const { Vec::new() }; 64] }; 4],
+            len: [0; 4],
+        }
+    }
+    fn take(&mut self, class: usize) -> Vec<u8> {
+        if self.len[class] != 0 {
+            self.len[class] -= 1;
+            std::mem::take(&mut self.slots[class][self.len[class]])
+        } else {
+            Vec::with_capacity([1024, 4096, 16384, 65536][class])
+        }
+    }
+    fn release(&mut self, mut b: Vec<u8>) {
+        let class = match b.capacity() {
+            1..=1024 => 0,
+            1025..=4096 => 1,
+            4097..=16384 => 2,
+            16385..=65536 => 3,
+            _ => return,
+        };
+        let n = self.len[class];
+        if n < 64 {
+            b.clear();
+            self.slots[class][n] = b;
+            self.len[class] += 1;
+        }
+    }
+}
+thread_local! { static BUFFERS: RefCell<Pool> = const { RefCell::new(Pool::new()) }; }
 pub(crate) fn take() -> Vec<u8> {
     BUFFERS.with(|p| {
-        p.borrow_mut()
-            .pop()
-            .unwrap_or_else(|| Vec::with_capacity(4096))
+        let mut p = p.borrow_mut();
+        // Prefer an available response allocation over growing a small buffer.
+        let class = if p.len[2] > 0 {
+            2
+        } else if p.len[3] > 0 {
+            3
+        } else {
+            1
+        };
+        p.take(class)
     })
 }
-fn release(mut b: Vec<u8>) {
-    b.clear();
-    if b.capacity() > 0 && b.capacity() <= 64 * 1024 {
-        BUFFERS.with(|p| {
-            let mut p = p.borrow_mut();
-            if p.len() < 64 {
-                p.push(b);
-            }
-        });
-    }
+fn take_input() -> Vec<u8> {
+    BUFFERS.with(|p| p.borrow_mut().take(0))
+}
+fn release(b: Vec<u8>) {
+    BUFFERS.with(|p| p.borrow_mut().release(b));
 }
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP framing")
@@ -79,7 +119,7 @@ pub async fn serve(mut stream: TcpStream) {
             if stream.readable().await.is_err() {
                 return;
             }
-            input = take();
+            input = take_input();
             match stream.try_read_buf(&mut input) {
                 Ok(0) => {
                     release(input);
@@ -213,7 +253,10 @@ async fn handle_one(s: &mut TcpStream, input: &mut Vec<u8>) -> io::Result<bool> 
         .await
         .unwrap_or_else(api::error_response);
     // Serialize headers and body once, then reuse the output allocation for the write.
-    let mut output = take();
+    let mut output = Header {
+        bytes: [0; 128],
+        len: 0,
+    };
     output.extend_from_slice(b"HTTP/1.1 ");
     output.extend_from_slice(itoa::Buffer::new().format(resp.status).as_bytes());
     output.extend_from_slice(b" OK\r\nContent-Type: application/json\r\n");
@@ -232,12 +275,24 @@ async fn handle_one(s: &mut TcpStream, input: &mut Vec<u8>) -> io::Result<bool> 
     } else {
         &resp.body
     };
-    let written = write_response(s, &output, payload).await;
-    release(output);
+    let written = write_response(s, &output.bytes[..output.len], payload).await;
     release(resp.body);
     written?;
     input.drain(..end);
     Ok(!close)
+}
+
+// Fixed HTTP fields plus the status and Content-Length fit in 128 bytes.
+struct Header {
+    bytes: [u8; 128],
+    len: usize,
+}
+impl Header {
+    fn extend_from_slice(&mut self, b: &[u8]) {
+        let end = self.len + b.len();
+        self.bytes[self.len..end].copy_from_slice(b);
+        self.len = end;
+    }
 }
 
 struct Head {

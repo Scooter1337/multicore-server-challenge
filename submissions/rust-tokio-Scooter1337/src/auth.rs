@@ -61,21 +61,28 @@ impl Jwt {
         mac.update(signed.as_bytes());
         mac.verify_slice(&sig_bytes).ok()?;
 
-        // Typical tokens use only stack buffers; unusually large valid tokens still work.
-        let mut header_buf = [0u8; 512];
-        let mut payload_buf = [0u8; 2048];
-        let header_bytes = decode(header, &mut header_buf)?;
-        let payload_bytes = decode(payload, &mut payload_buf)?;
-        // JWT headers and claims are JSON objects; Serde structs also accept arrays.
-        if header_bytes.trim_ascii_start().first() != Some(&b'{')
-            || payload_bytes.trim_ascii_start().first() != Some(&b'{')
-        {
-            return None;
+        // The standard header has a known HS256 algorithm. Its signature is
+        // still verified above on every request; other valid headers use JSON.
+        if header != HEADER {
+            let mut header_buf = [0u8; 512];
+            let bytes = decode(header, &mut header_buf)?;
+            if bytes.trim_ascii_start().first() != Some(&b'{') {
+                return None;
+            }
+            #[derive(Deserialize)]
+            struct Header<'a> {
+                #[serde(borrow)]
+                alg: Cow<'a, str>,
+            }
+            let decoded: Header<'_> = serde_json::from_slice(&bytes).ok()?;
+            if decoded.alg != "HS256" {
+                return None;
+            }
         }
-        #[derive(Deserialize)]
-        struct Header<'a> {
-            #[serde(borrow)]
-            alg: Cow<'a, str>,
+        let mut payload_buf = [0u8; 2048];
+        let payload_bytes = decode(payload, &mut payload_buf)?;
+        if payload_bytes.trim_ascii_start().first() != Some(&b'{') {
+            return None;
         }
         #[derive(Deserialize)]
         struct Claims<'a> {
@@ -83,10 +90,6 @@ impl Jwt {
             sub: Cow<'a, str>,
             exp: f64,
             nbf: Option<f64>,
-        }
-        let header: Header<'_> = serde_json::from_slice(&header_bytes).ok()?;
-        if header.alg != "HS256" {
-            return None;
         }
         let claims: Claims<'_> = serde_json::from_slice(&payload_bytes).ok()?;
         let now = SystemTime::now()

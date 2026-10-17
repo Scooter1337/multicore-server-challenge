@@ -70,21 +70,22 @@ impl ToSql for Param {
 struct Job {
     statement: Statement,
     params: Vec<Param>,
+    encoded: Option<Bytes>,
     reply: oneshot::Sender<Result<Vec<Row>, Error>>,
 }
 enum Mode {
     Direct(tokio_postgres::Client),
-    Group(mpsc::Sender<Job>),
+    Group(mpsc::Sender<Job>, bool),
 }
 pub struct Client(Mode);
 impl Client {
     pub fn new(client: tokio_postgres::Client, write: bool) -> Self {
-        if !write {
+        if !write && std::env::var("READ_BATCH_SIZE").ok().as_deref() == Some("0") {
             return Self(Mode::Direct(client));
         }
         let (tx, rx) = mpsc::channel(1024);
-        tokio::spawn(actor(client, rx));
-        Self(Mode::Group(tx))
+        tokio::spawn(actor(client, rx, write));
+        Self(Mode::Group(tx, !write))
     }
     pub async fn query(
         &self,
@@ -93,29 +94,36 @@ impl Client {
     ) -> Result<Vec<Row>, Error> {
         match &self.0 {
             Mode::Direct(c) => c.query(st, params).await.map_err(Error::from),
-            Mode::Group(tx) => {
+            Mode::Group(tx, read) => {
                 if params.len() != st.params().len() {
                     return Err(Error::Parameter("parameter count".into()));
                 }
-                let mut owned = Vec::with_capacity(params.len());
-                for (p, ty) in params.iter().zip(st.params()) {
-                    let mut bytes = BytesMut::new();
-                    let null = p
-                        .to_sql_checked(ty, &mut bytes)
-                        .map_err(|e| Error::Parameter(e.to_string()))?;
-                    owned.push(Param {
-                        bytes: if matches!(null, IsNull::Yes) {
-                            None
-                        } else {
-                            Some(bytes.freeze())
-                        },
-                        format: p.encode_format(ty),
-                    });
-                }
+                let mut owned = Vec::new();
+                let encoded = if *read {
+                    Some(tokio_postgres::Client::encode_group_query(st, params)?)
+                } else {
+                    owned.reserve(params.len());
+                    for (p, ty) in params.iter().zip(st.params()) {
+                        let mut bytes = BytesMut::new();
+                        let null = p
+                            .to_sql_checked(ty, &mut bytes)
+                            .map_err(|e| Error::Parameter(e.to_string()))?;
+                        owned.push(Param {
+                            bytes: if matches!(null, IsNull::Yes) {
+                                None
+                            } else {
+                                Some(bytes.freeze())
+                            },
+                            format: p.encode_format(ty),
+                        });
+                    }
+                    None
+                };
                 let (reply, rx) = oneshot::channel();
                 tx.send(Job {
                     statement: st.clone(),
                     params: owned,
+                    encoded,
                     reply,
                 })
                 .await
@@ -151,6 +159,13 @@ impl Client {
     }
 }
 async fn execute(client: &tokio_postgres::Client, job: &Job) -> Result<Vec<Row>, Error> {
+    if let Some(encoded) = &job.encoded {
+        return client
+            .query_group_encoded(&[(&job.statement, encoded.clone())])
+            .await
+            .map(|mut results| results.pop().expect("one query"))
+            .map_err(Error::from);
+    }
     client
         .query_raw(&job.statement, job.params.iter())
         .await?
@@ -159,20 +174,32 @@ async fn execute(client: &tokio_postgres::Client, job: &Job) -> Result<Vec<Row>,
         .map_err(Error::from)
 }
 use futures_util::TryStreamExt;
-async fn actor(client: tokio_postgres::Client, mut rx: mpsc::Receiver<Job>) {
-    let delay = std::env::var("WRITE_BATCH_US")
-        .ok()
-        .map(|s| s.parse::<u64>().expect("WRITE_BATCH_US"))
-        .unwrap_or(1000);
+async fn actor(client: tokio_postgres::Client, mut rx: mpsc::Receiver<Job>, write: bool) {
+    let delay = std::env::var(if write {
+        "WRITE_BATCH_US"
+    } else {
+        "READ_BATCH_US"
+    })
+    .ok()
+    .map(|s| s.parse::<u64>().expect("WRITE_BATCH_US"))
+    .unwrap_or(if write { 1000 } else { 0 });
+    let batch_limit = if write {
+        128
+    } else {
+        std::env::var("READ_BATCH_SIZE")
+            .ok()
+            .map(|s| s.parse().expect("READ_BATCH_SIZE"))
+            .unwrap_or(32)
+    };
     while let Some(first) = rx.recv().await {
         let mut jobs = Vec::with_capacity(32);
         jobs.push(first);
         // Under load the preceding flush already collected a batch. At low load,
         // one millisecond gives concurrent writes a chance to share a flush.
-        if rx.is_empty() {
+        if delay > 0 && rx.is_empty() {
             tokio::time::sleep(Duration::from_micros(delay)).await;
         }
-        while jobs.len() < 128 {
+        while jobs.len() < batch_limit {
             match rx.try_recv() {
                 Ok(job) => jobs.push(job),
                 Err(_) => break,
@@ -182,6 +209,35 @@ async fn actor(client: tokio_postgres::Client, mut rx: mpsc::Receiver<Job>) {
             let job = jobs.pop().unwrap();
             let result = execute(&client, &job).await;
             let _ = job.reply.send(result);
+            continue;
+        }
+        if !write {
+            let requests: Vec<_> = jobs
+                .iter()
+                .map(|job| {
+                    (
+                        &job.statement,
+                        job.encoded.as_ref().expect("read query frame").clone(),
+                    )
+                })
+                .collect();
+            let results = client.query_group_encoded(&requests).await;
+            drop(requests);
+            match results {
+                Ok(results) => {
+                    for (job, rows) in jobs.into_iter().zip(results) {
+                        let _ = job.reply.send(Ok(rows));
+                    }
+                }
+                Err(_) => {
+                    // The implicit transaction ended at Sync. Only read-only
+                    // jobs enter this branch, so individual retries are safe.
+                    for job in jobs {
+                        let result = execute(&client, &job).await;
+                        let _ = job.reply.send(result);
+                    }
+                }
+            }
             continue;
         }
         if let Err(e) = client.batch_execute("BEGIN").await {

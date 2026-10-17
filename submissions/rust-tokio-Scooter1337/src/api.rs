@@ -98,21 +98,34 @@ impl<'a> Auth<'a> {
 }
 
 /// First value of each query parameter (like Go's `url.Values.Get`).
-struct Query<'a>(Vec<(Cow<'a, str>, Cow<'a, str>)>);
+struct Query<'a>([Option<Cow<'a, str>>; 5]);
 
 impl<'a> Query<'a> {
-    fn parse(q: Option<&'a str>) -> Self {
-        Query(
-            q.map(|q| form_urlencoded::parse(q.as_bytes()).collect())
-                .unwrap_or_default(),
-        )
+    fn index(key: &str) -> Option<usize> {
+        match key {
+            "limit" => Some(0),
+            "offset" => Some(1),
+            "tag" => Some(2),
+            "author" => Some(3),
+            "favorited" => Some(4),
+            _ => None,
+        }
     }
-
+    fn parse(q: Option<&'a str>) -> Self {
+        let mut values = [const { None }; 5];
+        if let Some(q) = q {
+            for (key, value) in form_urlencoded::parse(q.as_bytes()) {
+                if let Some(i) = Self::index(&key)
+                    && values[i].is_none()
+                {
+                    values[i] = Some(value);
+                }
+            }
+        }
+        Self(values)
+    }
     fn get(&self, key: &str) -> Option<&str> {
-        self.0
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_ref())
+        self.0[Self::index(key)?].as_deref()
     }
 
     /// A non-empty filter value.
@@ -258,10 +271,7 @@ fn write_article(out: &mut Vec<u8>, row: &Row, b: usize, with_body: bool) {
     }
     out.extend_from_slice(b",\"tagList\":");
     row.get::<_, json::Tags<'_>>(k + 2).write(out);
-    out.extend_from_slice(b",\"createdAt\":");
-    json::ts(out, &row.get(k));
-    out.extend_from_slice(b",\"updatedAt\":");
-    json::ts(out, &row.get(k + 1));
+    json::times(out, &row.get(k), &row.get(k + 1));
     out.extend_from_slice(b",\"favorited\":");
     json::bool(out, row.get(k + 4));
     out.extend_from_slice(b",\"favoritesCount\":");
@@ -323,10 +333,7 @@ fn user_envelope(row: &Row, token: &str) -> Vec<u8> {
 fn write_comment(out: &mut Vec<u8>, row: &Row, b: usize, following: bool) {
     out.extend_from_slice(b"{\"id\":");
     json::int(out, row.get(b));
-    out.extend_from_slice(b",\"createdAt\":");
-    json::ts(out, &row.get(b + 2));
-    out.extend_from_slice(b",\"updatedAt\":");
-    json::ts(out, &row.get(b + 3));
+    json::times(out, &row.get(b + 2), &row.get(b + 3));
     out.extend_from_slice(b",\"body\":");
     json::str(out, row.get(b + 1));
     out.extend_from_slice(b",\"author\":");

@@ -197,6 +197,21 @@ impl Tags<'_> {
     }
 }
 
+/// Reuse a timestamp already formatted in this response when the two values match.
+/// This borrows no result across requests and still reads both database columns.
+pub fn times(out: &mut Vec<u8>, created: &Ts, updated: &Ts) {
+    out.extend_from_slice(b",\"createdAt\":");
+    let start = out.len();
+    ts(out, created);
+    let end = out.len();
+    out.extend_from_slice(b",\"updatedAt\":");
+    if created.0 == updated.0 {
+        out.extend_from_within(start..end);
+    } else {
+        ts(out, updated);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
