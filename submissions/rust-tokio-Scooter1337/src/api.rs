@@ -412,7 +412,7 @@ async fn login(body: &[u8]) -> Result<Resp> {
     let email = required(&mut obj, "email")?;
     let password = required(&mut obj, "password")?;
     let row = {
-        let c = app().db.read();
+        let c = app().db.read(crate::db::ReadKind::UserEmail);
         c.client
             .query_opt(&c.st.user_by_email, &[&email])
             .await?
@@ -428,7 +428,7 @@ async fn login(body: &[u8]) -> Result<Resp> {
 
 async fn current_user(auth: Auth<'_>) -> Result<Resp> {
     let (id, token) = auth.user()?;
-    let c = app().db.read();
+    let c = app().db.read(crate::db::ReadKind::UserId);
     let row = c
         .client
         .query_opt(&c.st.user_by_id, &[&id])
@@ -466,7 +466,7 @@ async fn update_user(auth: Auth<'_>, body: &[u8]) -> Result<Resp> {
 
 async fn profile(auth: Auth<'_>, username: &str) -> Result<Resp> {
     let viewer = auth.viewer()?;
-    let c = app().db.read();
+    let c = app().db.read(crate::db::ReadKind::Profile);
     let row = c
         .client
         .query_opt(&c.st.profile, &[&viewer, &username])
@@ -501,18 +501,26 @@ async fn list(auth: Auth<'_>, query: Option<&str>) -> Result<Resp> {
     let viewer = auth.viewer()?;
     let q = Query::parse(query);
     let (limit, offset) = q.page()?;
-    let c = app().db.read();
-    let rows = if let Some(tag) = q.filter("tag") {
-        c.client
-            .query(&c.st.list_tag, &[&viewer, &limit, &offset, &tag])
-            .await?
+    use crate::db::ReadKind;
+    let (family, filter) = if let Some(tag) = q.filter("tag") {
+        (ReadKind::Tag, Some(tag))
     } else if let Some(author) = q.filter("author") {
-        c.client
-            .query(&c.st.list_author, &[&viewer, &limit, &offset, &author])
-            .await?
+        (ReadKind::Author, Some(author))
     } else if let Some(fav) = q.filter("favorited") {
+        (ReadKind::Favorited, Some(fav))
+    } else {
+        (ReadKind::All, None)
+    };
+    let c = app().db.read(family);
+    let rows = if let Some(filter) = filter {
+        let st = match family {
+            ReadKind::Tag => &c.st.list_tag,
+            ReadKind::Author => &c.st.list_author,
+            ReadKind::Favorited => &c.st.list_favorited,
+            _ => unreachable!("filtered list family"),
+        };
         c.client
-            .query(&c.st.list_favorited, &[&viewer, &limit, &offset, &fav])
+            .query(st, &[&viewer, &limit, &offset, &filter])
             .await?
     } else {
         c.client
@@ -526,7 +534,7 @@ async fn list(auth: Auth<'_>, query: Option<&str>) -> Result<Resp> {
 async fn feed(auth: Auth<'_>, query: Option<&str>) -> Result<Resp> {
     let (viewer, _) = auth.user()?;
     let (limit, offset) = Query::parse(query).page()?;
-    let c = app().db.read();
+    let c = app().db.read(crate::db::ReadKind::Feed);
     let rows = c
         .client
         .query(
@@ -540,7 +548,7 @@ async fn feed(auth: Auth<'_>, query: Option<&str>) -> Result<Resp> {
 
 async fn get_article(auth: Auth<'_>, slug: &str) -> Result<Resp> {
     let viewer = auth.viewer()?;
-    let c = app().db.read();
+    let c = app().db.read(crate::db::ReadKind::ArticleSlug);
     let row = c
         .client
         .query_opt(&c.st.article_by_slug, &[&viewer, &slug])
@@ -605,7 +613,7 @@ async fn update_article(auth: Auth<'_>, slug: &str, body: &[u8]) -> Result<Resp>
         return Err(ApiError::Forbidden);
     }
     drop(c);
-    let c = app().db.read();
+    let c = app().db.read(crate::db::ReadKind::ArticleId);
     let row = c
         .client
         .query_opt(&c.st.article_by_id, &[&viewer, &id])
@@ -640,7 +648,7 @@ async fn favorite(auth: Auth<'_>, slug: &str, on: bool) -> Result<Resp> {
         .ok_or(ApiError::NotFound)?;
     let id: i64 = row.get(0);
     drop(c);
-    let c = app().db.read();
+    let c = app().db.read(crate::db::ReadKind::ArticleId);
     let row = c
         .client
         .query_opt(&c.st.article_by_id, &[&viewer, &id])
@@ -654,7 +662,7 @@ async fn favorite(auth: Auth<'_>, slug: &str, on: bool) -> Result<Resp> {
 
 async fn comments(auth: Auth<'_>, slug: &str) -> Result<Resp> {
     let viewer = auth.viewer()?;
-    let c = app().db.read();
+    let c = app().db.read(crate::db::ReadKind::Comments);
     let rows = c
         .client
         .query(&c.st.comments_list, &[&viewer, &slug])
@@ -715,7 +723,7 @@ async fn delete_comment(auth: Auth<'_>, slug: &str, id: &str) -> Result<Resp> {
 // ---------- tags ----------
 
 async fn tags() -> Result<Resp> {
-    let c = app().db.read();
+    let c = app().db.read(crate::db::ReadKind::Tags);
     let row = c.client.query_one(&c.st.tags, &[]).await?;
     drop(c);
     let mut out = crate::http::take();

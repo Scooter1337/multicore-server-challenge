@@ -7,6 +7,8 @@ mod db;
 mod http;
 mod json;
 mod password;
+#[cfg(feature = "group-commit")]
+mod read_batch;
 mod sql;
 #[cfg(feature = "group-commit")]
 mod writer;

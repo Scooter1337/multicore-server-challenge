@@ -57,29 +57,59 @@ pub struct Conn {
     pub client: Client,
     pub st: Stmts,
     load: AtomicUsize,
+    families: [AtomicUsize; ReadKind::COUNT],
     closed: Arc<AtomicBool>,
 }
 
 struct Pool(RwLock<Box<[Arc<Conn>]>>);
 
+/// Routing metadata only; it never contains request arguments or database data.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub enum ReadKind {
+    All,
+    Tag,
+    Author,
+    Favorited,
+    Feed,
+    ArticleSlug,
+    ArticleId,
+    Profile,
+    UserId,
+    UserEmail,
+    Comments,
+    Tags,
+}
+impl ReadKind {
+    const COUNT: usize = 12;
+}
+
 pub struct Db {
+    route_slack: Option<usize>,
+    route_tags: bool,
     reads: Arc<Pool>,
     writes: Arc<Pool>,
 }
 
 /// A connection picked for one request; counts as load on it until dropped.
-pub struct Lease(Arc<Conn>);
+pub struct Lease {
+    conn: Arc<Conn>,
+    family: Option<ReadKind>,
+}
 
 impl Deref for Lease {
     type Target = Conn;
     fn deref(&self) -> &Conn {
-        &self.0
+        &self.conn
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.0.load.fetch_sub(1, Ordering::Relaxed);
+        if let Some(family) = self.family {
+            self.conn.families[family as usize].fetch_sub(1, Ordering::Relaxed);
+        }
+        self.conn.load.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -98,7 +128,21 @@ impl Db {
         )
         .await?;
         let writes = conns.split_off(reads);
+        let route_slack = if cfg!(feature = "group-commit")
+            && std::env::var("READ_BATCH_SIZE").ok().as_deref() != Some("0")
+            && std::env::var("READ_SQL_BATCH").ok().as_deref() != Some("0")
+        {
+            match std::env::var("READ_ROUTE_SLACK").ok().as_deref() {
+                Some("off") => None,
+                Some(value) => Some(value.parse::<usize>().expect("READ_ROUTE_SLACK").min(64)),
+                None => Some(8),
+            }
+        } else {
+            None
+        };
         let db = Db {
+            route_slack,
+            route_tags: std::env::var("READ_TAG_ROUTE").ok().as_deref() == Some("1"),
             reads: Arc::new(Pool(RwLock::new(conns.into_iter().map(Arc::new).collect()))),
             writes: Arc::new(Pool(RwLock::new(
                 writes.into_iter().map(Arc::new).collect(),
@@ -144,8 +188,17 @@ impl Db {
     }
 
     /// A connection for a read-only statement.
-    pub fn read(&self) -> Lease {
-        least_loaded(&self.reads)
+    pub fn read(&self, family: ReadKind) -> Lease {
+        // Comments have no combined query. Tag fanout routing is optional.
+        if matches!(family, ReadKind::Comments)
+            || matches!(family, ReadKind::Tags) && !self.route_tags
+        {
+            return least_loaded(&self.reads);
+        }
+        match self.route_slack {
+            Some(slack) => compatible(&self.reads, family, slack),
+            None => least_loaded(&self.reads),
+        }
     }
 
     /// A connection for a statement that writes (and so waits for a commit).
@@ -184,7 +237,66 @@ fn least_loaded(pool: &Pool) -> Lease {
     // silently wait for reconnection or replay potentially committed mutations.
     let conn = conns[best.unwrap_or(start)].clone();
     conn.load.fetch_add(1, Ordering::Relaxed);
-    Lease(conn)
+    Lease { conn, family: None }
+}
+
+/// Prefer useful batch membership only within a bounded distance of the least
+/// loaded healthy connection. No timer, request data or result cache is involved.
+fn compatible(pool: &Pool, family: ReadKind, slack: usize) -> Lease {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let conns = pool.0.read().expect("database pool");
+    let n = conns.len();
+    let start = NEXT.fetch_add(1, Ordering::Relaxed) % n;
+    let mut least = None;
+    let mut minimum = usize::MAX;
+    for i in 0..n {
+        let index = (start + i) % n;
+        let c = &conns[index];
+        if !c.closed.load(Ordering::Acquire) {
+            let load = c.load.load(Ordering::Relaxed);
+            if load < minimum {
+                minimum = load;
+                least = Some(index);
+            }
+        }
+    }
+    let mut selected = least.unwrap_or(start);
+    let mut best_load = minimum;
+    let mut best_matches = 0;
+    for i in 0..n {
+        let index = (start + i) % n;
+        let c = &conns[index];
+        if c.closed.load(Ordering::Acquire) {
+            continue;
+        }
+        let load = c.load.load(Ordering::Relaxed);
+        let matches = c.families[family as usize].load(Ordering::Relaxed);
+        if prefer(load, matches, minimum, slack, best_load, best_matches) {
+            selected = index;
+            best_load = load;
+            best_matches = matches;
+        }
+    }
+    let conn = conns[selected].clone();
+    conn.load.fetch_add(1, Ordering::Relaxed);
+    conn.families[family as usize].fetch_add(1, Ordering::Relaxed);
+    Lease {
+        conn,
+        family: Some(family),
+    }
+}
+
+#[inline]
+fn prefer(
+    load: usize,
+    matches: usize,
+    minimum: usize,
+    slack: usize,
+    best_load: usize,
+    best_matches: usize,
+) -> bool {
+    load <= minimum.saturating_add(slack)
+        && (matches > best_matches || matches == best_matches && load < best_load)
 }
 
 async fn connect_one(url: &str, _write: bool) -> Result<Conn, tokio_postgres::Error> {
@@ -248,7 +360,15 @@ async fn connect_one(url: &str, _write: bool) -> Result<Conn, tokio_postgres::Er
         )
         .await?,
         article_delete: p(sql::ARTICLE_DELETE, &[Type::TEXT, Type::INT8]).await?,
-        comments_list: p(sql::COMMENTS_LIST, &[Type::INT8, Type::TEXT]).await?,
+        comments_list: p(
+            if std::env::var("READ_COMMENT_SET").ok().as_deref() == Some("1") {
+                sql::COMMENTS_LIST_SET
+            } else {
+                sql::COMMENTS_LIST
+            },
+            &[Type::INT8, Type::TEXT],
+        )
+        .await?,
         comment_create: p(sql::COMMENT_CREATE, &[Type::TEXT, Type::INT8, Type::TEXT]).await?,
         comment_delete: p(sql::COMMENT_DELETE, &[Type::INT8, Type::TEXT, Type::INT8]).await?,
         profile: p(sql::PROFILE, &[Type::INT8, Type::TEXT]).await?,
@@ -272,11 +392,43 @@ async fn connect_one(url: &str, _write: bool) -> Result<Conn, tokio_postgres::Er
         .await?,
     };
     #[cfg(feature = "group-commit")]
-    let client = Client::new(client, _write);
+    let batches = if !_write
+        && std::env::var("READ_SQL_BATCH").ok().as_deref() != Some("0")
+        && std::env::var("READ_BATCH_SIZE").ok().as_deref() != Some("0")
+    {
+        crate::read_batch::prepare(&client, &st).await?
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "group-commit")]
+    let client = Client::new(client, _write, batches);
     Ok(Conn {
         client,
         st,
         load: AtomicUsize::new(0),
+        families: std::array::from_fn(|_| AtomicUsize::new(0)),
         closed,
     })
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::prefer;
+
+    #[test]
+    fn affinity_has_a_load_bound() {
+        assert!(prefer(2, 2, 0, 2, 0, 0));
+        assert!(!prefer(3, 3, 0, 2, 0, 0));
+        assert!(!prefer(1, 1, 0, 0, 0, 0));
+        assert!(prefer(10, 4, 8, 2, 8, 3));
+        assert!(!prefer(11, 9, 8, 2, 8, 3));
+    }
+
+    #[test]
+    fn equal_affinity_uses_less_load_and_preserves_rotating_ties() {
+        assert!(prefer(3, 2, 2, 2, 4, 2));
+        assert!(!prefer(4, 2, 2, 2, 3, 2));
+        assert!(!prefer(3, 2, 2, 2, 3, 2));
+        assert!(!prefer(3, 1, 2, 2, 4, 2));
+    }
 }

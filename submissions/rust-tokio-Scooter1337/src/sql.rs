@@ -139,6 +139,16 @@ LEFT JOIN users u ON u.id = c.author_id
 WHERE a.slug = $2
 ORDER BY c.created_at DESC, c.id DESC";
 
+/// Materialize the viewer's followee set once for all comments in this execution.
+pub const COMMENTS_LIST_SET: &str = "SELECT a.id, c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,
+ COALESCE(c.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1), false)
+FROM articles a
+LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c WHERE c.article_id = a.id
+                   ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true
+LEFT JOIN users u ON u.id = c.author_id
+WHERE a.slug = $2
+ORDER BY c.created_at DESC, c.id DESC";
+
 /// No row = no article.
 pub const COMMENT_CREATE: &str = "WITH t AS (SELECT id FROM articles WHERE slug = $1),
  c AS (INSERT INTO comments (article_id, author_id, body) SELECT id, $2, $3 FROM t
