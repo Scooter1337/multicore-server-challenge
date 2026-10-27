@@ -1,0 +1,3 @@
+Based on rust-epoll-WorriedArrow by WorriedArrow, from the Multicore Server Challenge (MIT licensed).
+Source: https://github.com/arjaythedev/multicore-server-challenge/tree/884815dd67344e227c09e0fdb2d2238d8994fbfd/submissions/rust-epoll-WorriedArrow
+Original copyright and permission notice are retained in LICENSE.
