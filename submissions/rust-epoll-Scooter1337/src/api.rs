@@ -76,8 +76,8 @@ struct Query {
     tag: Option<String>,
     author: Option<String>,
     favorited: Option<String>,
-    /// A tag/author/favorited value that can't match any row (NUL or invalid UTF-8).
-    unmatchable: bool,
+    /// Bit per filter whose first value cannot match PostgreSQL text.
+    unmatchable: u8,
 }
 
 fn parse_query(q: &[u8]) -> Query {
@@ -92,19 +92,19 @@ fn parse_query(q: &[u8]) -> Query {
         };
         let Some(k) = unescape(k, true) else { continue };
         let (slot, filter) = match k.as_str() {
-            "limit" => (&mut out.limit, false),
-            "offset" => (&mut out.offset, false),
-            "tag" => (&mut out.tag, true),
-            "author" => (&mut out.author, true),
-            "favorited" => (&mut out.favorited, true),
+            "limit" => (&mut out.limit, 0),
+            "offset" => (&mut out.offset, 0),
+            "tag" => (&mut out.tag, 1),
+            "author" => (&mut out.author, 2),
+            "favorited" => (&mut out.favorited, 4),
             _ => continue,
         };
         if slot.is_none() {
             match unescape(v, true) {
                 Some(v) => *slot = Some(v),
-                None if filter => {
+                None if filter != 0 => {
                     *slot = Some(String::new());
-                    out.unmatchable = true;
+                    out.unmatchable |= filter;
                 }
                 // limit/offset: not a number -> 422
                 None => *slot = Some("x".into()),
@@ -377,20 +377,32 @@ fn list(query: &[u8], v: i64, to: ReplyTo) -> Outcome {
     let Some((lim, off)) = limit_offset(&q) else {
         return err(422, "limit must be 1-100 and offset >= 0");
     };
-    if q.unmatchable {
-        return Outcome::Now(200, b"{\"articles\":[],\"articlesCount\":0}".to_vec());
+    for (value, filter) in [(q.tag, 1), (q.author, 2), (q.favorited, 4)] {
+        if q.unmatchable & filter != 0 {
+            return Outcome::Now(200, b"{\"articles\":[],\"articlesCount\":0}".to_vec());
+        }
+        if let Some(value) = value.filter(|s| !s.is_empty()) {
+            let kind = match filter {
+                1 => Read::Tag {
+                    tag: value,
+                    lim,
+                    off,
+                },
+                2 => Read::Author {
+                    username: value,
+                    lim,
+                    off,
+                },
+                _ => Read::Favorited {
+                    username: value,
+                    lim,
+                    off,
+                },
+            };
+            return read(kind, v, to);
+        }
     }
-    let nonempty = |s: &Option<String>| s.as_ref().filter(|s| !s.is_empty()).cloned();
-    let kind = if let Some(tag) = nonempty(&q.tag) {
-        Read::Tag { tag, lim, off }
-    } else if let Some(username) = nonempty(&q.author) {
-        Read::Author { username, lim, off }
-    } else if let Some(username) = nonempty(&q.favorited) {
-        Read::Favorited { username, lim, off }
-    } else {
-        Read::Global { lim, off }
-    };
-    read(kind, v, to)
+    read(Read::Global { lim, off }, v, to)
 }
 
 fn register(body: &[u8], to: ReplyTo) -> Outcome {
@@ -543,4 +555,39 @@ fn update_article(body: &[u8], slug: String, v: i64, to: ReplyTo) -> Outcome {
         v,
         to,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_unused_filters_preserve_precedence_and_first_value() {
+        let to = ReplyTo {
+            thread: 0,
+            slot: 0,
+            generation: 0,
+        };
+        for (query, expected) in [
+            (&b"tag=rust&author=%00&favorited=%FF"[..], 1),
+            (&b"author=alice&favorited=%00"[..], 2),
+            (&b"tag=&favorited=alice"[..], 4),
+            (&b"tag=rust&tag=%00"[..], 1),
+        ] {
+            assert!(matches!(list(query, 0, to), Outcome::Queued));
+            let mut jobs = Vec::new();
+            db::READS.take(1, &mut jobs);
+            assert!(matches!(
+                (&jobs[0].kind, expected),
+                (Read::Tag { .. }, 1) | (Read::Author { .. }, 2) | (Read::Favorited { .. }, 4)
+            ));
+        }
+        for query in [
+            &b"tag=%00&author=alice"[..],
+            &b"author=%FF&favorited=alice"[..],
+            &b"tag=%00&tag=rust"[..],
+        ] {
+            assert!(matches!(list(query, 0, to), Outcome::Now(200, _)));
+        }
+    }
 }

@@ -12,6 +12,8 @@ const LISTENER: u64 = u64::MAX;
 const OUTBOX: u64 = u64::MAX - 1;
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
+// One maximum request, chunk framing and bounded pipelined staging.
+const MAX_INPUT: usize = MAX_HEAD + MAX_BODY + 64 * 1024;
 
 struct Conn {
     fd: RawFd,
@@ -183,6 +185,7 @@ impl Server {
                         let slot = slot as u32;
                         if ev.events & (libc::EPOLLOUT as u32) != 0 {
                             self.flush(slot);
+                            self.process(slot);
                         }
                         if ev.events
                             & (libc::EPOLLIN as u32
@@ -292,7 +295,7 @@ impl Server {
     fn on_readable(&mut self, slot: u32) {
         loop {
             let fd = self.conns[slot as usize].fd;
-            if fd < 0 {
+            if fd < 0 || self.conns[slot as usize].peer_closed {
                 return;
             }
             let n = unsafe {
@@ -316,29 +319,40 @@ impl Server {
             if n == 0 {
                 let c = &mut self.conns[slot as usize];
                 c.peer_closed = true;
-                if !c.busy {
-                    self.close(slot);
-                } else {
-                    // stop polling input; close once the in-flight response is done
-                    let _ = self.ctl(libc::EPOLL_CTL_MOD, fd, 0, slot as u64);
-                }
-                return;
+                // Keep output interest, but stop level-triggered EOF notifications.
+                let ev = if c.want_out { libc::EPOLLOUT } else { 0 };
+                let _ = self.ctl(libc::EPOLL_CTL_MOD, fd, ev as u32, slot as u64);
+                break;
             }
             let n = n as usize;
             let c = &mut self.conns[slot as usize];
+            if n > MAX_INPUT - c.inbuf.len() {
+                // A busy connection cannot parse pipelined input yet. Bound its
+                // staging allocation even when a client keeps sending.
+                self.close(slot);
+                return;
+            }
             c.inbuf.extend_from_slice(&self.scratch[..n]);
             if n < self.scratch.len() {
                 break;
             }
         }
         self.process(slot);
+        if self.conns[slot as usize].peer_closed {
+            self.after_write(slot);
+        }
     }
 
     /// Parses and dispatches as many requests as possible (one at a time per connection).
     fn process(&mut self, slot: u32) {
         loop {
             let c = &mut self.conns[slot as usize];
-            if c.fd < 0 || c.busy || c.inbuf.is_empty() {
+            if c.fd < 0
+                || c.busy
+                || c.close_after
+                || c.out_pos < c.outbuf.len()
+                || c.inbuf.is_empty()
+            {
                 if c.fd >= 0 && c.inbuf.capacity() > 0 && c.inbuf.is_empty() {
                     c.inbuf = Vec::new();
                 }
@@ -351,6 +365,8 @@ impl Server {
                 Ok(httparse::Status::Partial) => {
                     if c.inbuf.len() > MAX_HEAD {
                         self.fail(slot, 431);
+                    } else if c.peer_closed {
+                        self.fail(slot, 400);
                     }
                     return;
                 }
@@ -359,6 +375,10 @@ impl Server {
                     return;
                 }
             };
+            if head_len > MAX_HEAD {
+                self.fail(slot, 431);
+                return;
+            }
             let http10 = req.version == Some(0);
             let mut content_length: Option<usize> = None;
             let mut chunked = false;
@@ -373,8 +393,10 @@ impl Server {
                         .ok()
                         .and_then(|s| s.trim().parse().ok())
                     {
-                        Some(n) => content_length = Some(n),
-                        None => {
+                        Some(n) if content_length.is_none_or(|old| old == n) => {
+                            content_length = Some(n);
+                        }
+                        _ => {
                             self.fail(slot, 400);
                             return;
                         }
@@ -428,6 +450,10 @@ impl Server {
                             self.fail(slot, 413);
                             return;
                         }
+                        if c.peer_closed {
+                            self.fail(slot, 400);
+                            return;
+                        }
                         if expect_continue && !c.sent_continue {
                             c.sent_continue = true;
                             self.raw_send(slot, b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -446,6 +472,10 @@ impl Server {
                     return;
                 }
                 if c.inbuf.len() < head_len + cl {
+                    if c.peer_closed {
+                        self.fail(slot, 400);
+                        return;
+                    }
                     if expect_continue && !c.sent_continue {
                         c.sent_continue = true;
                         self.raw_send(slot, b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -650,7 +680,7 @@ impl Server {
                 c.outbuf = Vec::new();
             }
             c.out_pos = 0;
-            if !c.busy && (c.close_after || c.peer_closed) {
+            if !c.busy && (c.close_after || (c.peer_closed && c.inbuf.is_empty())) {
                 // only after the response, never while a request is in flight
                 self.close(slot);
                 return;
@@ -720,5 +750,149 @@ fn dechunk(b: &[u8]) -> Chunk {
             return Chunk::Bad;
         }
         p += size + 2;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixStream;
+
+    struct Client(Server, UnixStream);
+
+    impl Client {
+        fn new() -> Self {
+            let (server, client) = UnixStream::pair().unwrap();
+            server.set_nonblocking(true).unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let fd = server.into_raw_fd();
+            let ep = cvt(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) }).unwrap();
+            let s = Server {
+                thread: 0,
+                ep,
+                lfd: -1,
+                efd: -1,
+                free: Vec::new(),
+                scratch: vec![0; 256 * 1024],
+                keys: Box::leak(Box::new(crate::jwt::Keys::new(b"test"))),
+                conns: vec![Conn {
+                    fd,
+                    generation: 0,
+                    inbuf: Vec::new(),
+                    outbuf: Vec::new(),
+                    out_pos: 0,
+                    busy: false,
+                    close_after: false,
+                    peer_closed: false,
+                    want_out: false,
+                    sent_continue: false,
+                }],
+            };
+            s.ctl(
+                libc::EPOLL_CTL_ADD,
+                fd,
+                (libc::EPOLLIN | libc::EPOLLRDHUP) as u32,
+                0,
+            )
+            .unwrap();
+            Self(s, client)
+        }
+
+        fn request(&mut self, bytes: &[u8]) -> Vec<u8> {
+            self.0.conns[0].inbuf.extend_from_slice(bytes);
+            self.0.process(0);
+            let mut out = Vec::new();
+            self.1.read_to_end(&mut out).unwrap();
+            out
+        }
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            self.0.close(0);
+            unsafe {
+                libc::close(self.0.ep);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_lengths_and_complete_oversized_headers() {
+        let out = Client::new()
+            .request(b"POST /bad HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\nx");
+        assert!(out.starts_with(b"HTTP/1.1 400"));
+        let out = Client::new().request(b"POST /bad HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        assert!(out.starts_with(b"HTTP/1.1 404"));
+        let mut request = b"GET /bad HTTP/1.1\r\nX-Padding: ".to_vec();
+        request.resize(MAX_HEAD + 1, b'x');
+        request.extend_from_slice(b"\r\n\r\n");
+        assert!(Client::new().request(&request).starts_with(b"HTTP/1.1 431"));
+    }
+
+    #[test]
+    fn busy_input_is_bounded() {
+        let mut c = Client::new();
+        c.0.conns[0].busy = true;
+        c.0.conns[0].inbuf.resize(MAX_INPUT, b'x');
+        c.1.write_all(b"x").unwrap();
+        c.0.on_readable(0);
+        assert_eq!(c.0.conns[0].fd, -1);
+        assert_eq!(c.0.conns[0].inbuf.capacity(), 0);
+    }
+
+    #[test]
+    fn half_close_preserves_pipeline_and_pending_output() {
+        let mut c = Client::new();
+        c.0.conns[0]
+            .inbuf
+            .extend_from_slice(b"GET /bad HTTP/1.1\r\n\r\nGET /bad HTTP/1.1\r\n\r\n");
+        c.1.shutdown(std::net::Shutdown::Write).unwrap();
+        c.0.on_readable(0);
+        c.0.on_readable(0);
+        let mut out = String::new();
+        c.1.read_to_string(&mut out).unwrap();
+        assert_eq!(out.matches("HTTP/1.1 404").count(), 2);
+
+        let mut c = Client::new();
+        let small: libc::c_int = 4096;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    c.0.conns[0].fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &small as *const _ as *const _,
+                    4,
+                )
+            },
+            0
+        );
+        c.0.conns[0].busy = true;
+        let body = vec![b'x'; 256 * 1024];
+        c.0.respond(0, 200, &body);
+        assert!(c.0.conns[0].want_out);
+        c.1.shutdown(std::net::Shutdown::Write).unwrap();
+        c.0.on_readable(0);
+        let mut ev = [libc::epoll_event { events: 0, u64: 0 }];
+        let mut all = Vec::new();
+        let mut buf = [0; 8192];
+        while c.0.conns[0].fd >= 0 {
+            let n = c.1.read(&mut buf).unwrap();
+            assert!(n > 0);
+            all.extend_from_slice(&buf[..n]);
+            assert_eq!(
+                unsafe { libc::epoll_wait(c.0.ep, ev.as_mut_ptr(), 1, 1000) },
+                1
+            );
+            assert_ne!(ev[0].events & libc::EPOLLOUT as u32, 0);
+            c.0.flush(0);
+        }
+        c.1.read_to_end(&mut all).unwrap();
+        let head = memchr::memmem::find(&all, b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(&all[head..], &body);
     }
 }

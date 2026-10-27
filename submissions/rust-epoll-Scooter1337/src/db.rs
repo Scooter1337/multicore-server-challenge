@@ -1312,11 +1312,16 @@ impl WriteLane {
         };
         let failed = p.results.iter().any(|r| r.error.is_some());
         if failed && !single {
-            // rolled back: retry each on its own
-            for j in jobs {
+            // Sync skips COMMIT after a statement error; the explicit transaction
+            // remains aborted until ROLLBACK has completed.
+            if let Err(e) = rollback(conn) {
+                return Err((e, tos));
+            }
+            let mut jobs = jobs.into_iter();
+            while let Some(j) = jobs.next() {
                 let to = j.to;
                 if let Err(e) = self.one(j) {
-                    return Err((e, vec![to]));
+                    return Err((e, std::iter::once(to).chain(jobs.map(|j| j.to)).collect()));
                 }
             }
             return Ok(());
@@ -1347,10 +1352,25 @@ impl WriteLane {
         conn.out.sync();
         conn.flush()?;
         let p = conn.read_pipeline(n)?;
+        if k > 1 && p.results.iter().any(|r| r.error.is_some()) {
+            rollback(conn)?;
+        }
         let mut out = Vec::new();
         finish_write(j, &p, start, k, self.s, &mut out);
         reply::send_all(out);
         Ok(())
+    }
+}
+
+/// Consume recovery before reusing a connection or answering a failed write.
+fn rollback(conn: &mut Conn) -> pg::Result<()> {
+    conn.out.bind_exec("rollback", &[]);
+    conn.out.sync();
+    conn.flush()?;
+    let p = conn.read_pipeline(1)?;
+    match p.results.into_iter().find_map(|r| r.error) {
+        Some(e) => Err(pg::Error::Db(e)),
+        None => Ok(()),
     }
 }
 
@@ -1653,4 +1673,134 @@ fn run_lanes(pw: &[&[u8]], salts: &[[u8; 16]], cost: u32) -> Vec<[u8; 23]> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+
+    fn message(s: &mut TcpStream, tag: u8, body: &[u8]) {
+        s.write_all(&[tag]).unwrap();
+        s.write_all(&((body.len() + 4) as u32).to_be_bytes())
+            .unwrap();
+        s.write_all(body).unwrap();
+    }
+
+    fn pipeline(s: &mut TcpStream, names: &[&str]) {
+        let mut bound = Vec::new();
+        loop {
+            let mut head = [0; 5];
+            s.read_exact(&mut head).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(head[1..].try_into().unwrap()) as usize - 4];
+            s.read_exact(&mut body).unwrap();
+            if head[0] == b'B' {
+                bound.push(
+                    String::from_utf8(body[1..].split(|&b| b == 0).next().unwrap().to_vec())
+                        .unwrap(),
+                );
+            }
+            if head[0] == b'S' {
+                break;
+            }
+        }
+        assert_eq!(bound, names);
+    }
+
+    fn update(slot: u32) -> WriteJob {
+        WriteJob {
+            to: ReplyTo {
+                thread: 0,
+                slot,
+                generation: 0,
+            },
+            viewer: 1,
+            kind: Write::UpdateUser {
+                email: Some("taken@test".into()),
+                username: None,
+                hash: None,
+                bio: None,
+                image: None,
+                token: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn rollback_recovers_retries_and_transport_failure_preserves_pending_replies() {
+        // Script the PostgreSQL protocol to make failure ordering deterministic.
+        reply::init(1);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut len = [0; 4];
+            s.read_exact(&mut len).unwrap();
+            let mut startup = vec![0; u32::from_be_bytes(len) as usize - 4];
+            s.read_exact(&mut startup).unwrap();
+            message(&mut s, b'R', &0u32.to_be_bytes());
+            message(&mut s, b'Z', b"I");
+
+            // A multi-statement retry must recover its explicit transaction too.
+            pipeline(&mut s, &["begin", "newart", "newtags", "arttags", "commit"]);
+            message(&mut s, b'C', b"BEGIN\0");
+            message(&mut s, b'E', b"C23505\0Mconflict\0\0");
+            message(&mut s, b'Z', b"E");
+            pipeline(&mut s, &["rollback"]);
+            message(&mut s, b'C', b"ROLLBACK\0");
+            message(&mut s, b'Z', b"I");
+
+            pipeline(
+                &mut s,
+                &["begin", "upduser", "upduser", "upduser", "commit"],
+            );
+            message(&mut s, b'C', b"BEGIN\0");
+            message(&mut s, b'E', b"C23505\0Mconflict\0\0");
+            message(&mut s, b'Z', b"E");
+            pipeline(&mut s, &["rollback"]);
+            message(&mut s, b'C', b"ROLLBACK\0");
+            message(&mut s, b'Z', b"I");
+            pipeline(&mut s, &["upduser"]);
+            message(&mut s, b'C', b"UPDATE 0\0");
+            message(&mut s, b'Z', b"I");
+            // The next write's outcome is unknown. Never retry it or drop later replies.
+            pipeline(&mut s, &["upduser"]);
+        });
+        let keys = Box::leak(Box::new(crate::jwt::Keys::new(b"test")));
+        let settings = Box::leak(Box::new(Settings {
+            cfg: pg::Config::parse(&format!("postgres://test:test@127.0.0.1:{port}/test")).unwrap(),
+            keys,
+            read_batch: 1,
+            read_min: 1,
+            read_window: Duration::ZERO,
+            write_batch: 3,
+            bcrypt_lanes: 1,
+            bcrypt_window: Duration::ZERO,
+        }));
+        let mut lane = WriteLane::new(settings);
+        lane.conn = Some(Conn::connect(&settings.cfg).unwrap());
+        let mut article = update(9);
+        article.kind = Write::CreateArticle {
+            title: "test".into(),
+            description: String::new(),
+            body: String::new(),
+            tags: vec!["test".into()],
+        };
+        lane.one(article).unwrap();
+        let (_, left) = lane
+            .group(vec![update(0), update(1), update(2)])
+            .unwrap_err();
+        assert_eq!(left.iter().map(|to| to.slot).collect::<Vec<_>>(), [1, 2]);
+        let replies = reply::outbox(0).queue.lock().unwrap();
+        assert_eq!(
+            replies
+                .iter()
+                .map(|r| (r.to.slot, r.status))
+                .collect::<Vec<_>>(),
+            [(9, 422), (0, 401)]
+        );
+        server.join().unwrap();
+    }
 }

@@ -191,6 +191,7 @@ pub fn write_statements() -> Vec<Stmt> {
     vec![
         s("begin", "BEGIN", &[]),
         s("commit", "COMMIT", &[]),
+        s("rollback", "ROLLBACK", &[]),
         s(
             "register",
             "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING \
