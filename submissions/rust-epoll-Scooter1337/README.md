@@ -16,7 +16,7 @@ Changes from that implementation:
 
 197/197 conformance checks pass on both seeds, plus concurrent differential reads and mixed-viewer checks.
 
-Before the transaction/HTTP fixes, the local MEGASERVER comparison was: app + PostgreSQL share 8 CPUs / 16 GiB, with generators on the same host. Using the unmodified repository workload, a 60-second ramp and five-minute measured hold, the optimized version passed at **128,000 users**: **32,033 req/s**, p95 **464 ms**, p99 **652 ms**, zero errors. The unchanged #47 implementation fails the matching 128,000-user hold (p95 **513 ms**); its complete repository search scores **120,000 users**.
+Before the transaction/HTTP fixes, the local comparison was: app + PostgreSQL share 8 CPUs / 16 GiB, with generators on the same host. Using the unmodified repository workload, a 60-second ramp and five-minute measured hold, the optimized version passed at **128,000 users**: **32,033 req/s**, p95 **464 ms**, p99 **652 ms**, zero errors. The unchanged #47 implementation fails the matching 128,000-user hold (p95 **513 ms**); its complete repository search scores **120,000 users**.
 
 After those fixes, four paired one-minute runs at 128,000 users averaged **32,163 req/s**, versus **32,268 req/s** before the fixes (−0.33%), with zero errors. Fixed p95 was 467/638 ms; control p95 was 442/506 ms. Each version passed once and missed the latency limit once. The five-minute hold has not been repeated after these fixes.
 
