@@ -17,3 +17,9 @@ intermediate vectors are allocated; the bytes are the same.
 
 `src/bin/group-check.rs` in the application checks group sizes, empty results,
 SQL-error recovery, packed frames and separate READ COMMITTED snapshots.
+
+Shared article serialization: each immutable result `Group` can lazily own per-row
+JSON bytes and the offsets of its two viewer-dependent fields. Cloned row handles
+share the bytes through `OnceLock`; the application inserts each request's flags
+separately. The storage is released with the last row handle and is never reused
+by another query.
